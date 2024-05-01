@@ -1460,11 +1460,28 @@ pub fn sendmsg<S>(fd: RawFd, iov: &[IoSlice<'_>], cmsgs: &[ControlMessage],
 
     // First size the buffer needed to hold the cmsgs.  It must be zeroed,
     // because subsequent code will not clear the padding bytes.
-    let mut cmsg_buffer = vec![0u8; capacity];
+    let layout = std::alloc::Layout::from_size_align(capacity, mem::align_of::<cmsghdr>()).unwrap();
+    let cmsg_buffer = if capacity > 0 {
+        unsafe { std::alloc::alloc_zeroed(layout) }
+    } else {
+        ptr::null_mut()
+    };
 
-    let mhdr = pack_mhdr_to_send(&mut cmsg_buffer[..], iov, cmsgs, addr);
+    let mhdr = unsafe {
+        pack_mhdr_to_send(
+            cmsg_buffer as *mut libc::c_void,
+            capacity,
+            iov,
+            cmsgs,
+            addr,
+        )
+    };
 
     let ret = unsafe { libc::sendmsg(fd, &mhdr, flags.bits()) };
+
+    if capacity > 0 {
+        unsafe { std::alloc::dealloc(cmsg_buffer, layout) };
+    }
 
     Errno::result(ret).map(|r| r as usize)
 }
@@ -1848,8 +1865,9 @@ unsafe fn pack_mhdr_to_receive<S>(
     }
 }
 
-fn pack_mhdr_to_send<'a, I, C, S>(
-    cmsg_buffer: &mut [u8],
+unsafe fn pack_mhdr_to_send<'a, I, C, S>(
+    cmsg_ptr: *mut libc::c_void,
+    capacity: usize,
     iov: I,
     cmsgs: C,
     addr: Option<&S>
@@ -1859,15 +1877,7 @@ fn pack_mhdr_to_send<'a, I, C, S>(
         C: AsRef<[ControlMessage<'a>]>,
         S: SockaddrLike + 'a
 {
-    let capacity = cmsg_buffer.len();
-
     // The message header must be initialized before the individual cmsgs.
-    let cmsg_ptr = if capacity > 0 {
-        cmsg_buffer.as_mut_ptr().cast()
-    } else {
-        ptr::null_mut()
-    };
-
     let mhdr = unsafe {
         // Musl's msghdr has private fields, so this is the only way to
         // initialize it.
